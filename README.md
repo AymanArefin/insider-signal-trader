@@ -49,23 +49,7 @@ flowchart TD
 
 ## Built on the Cloudflare Agents SDK
 
-Both stateful services extend `Agent` from `@cloudflare/agents` — Durable Objects with embedded SQLite, typed state, and a built-in scheduler:
-
-### `FormScannerAgent extends Agent<Env, FormScannerState>`
-*`src/agents/formScanner.ts`*
-
-- Persists `lastScannedAt` and `pendingSignalIds` across requests via `this.setState()`
-- Handles `POST /scan` via `onRequest()` — no manual fetch dispatch needed
-
-### `DecisionAgent extends Agent<Env, DecisionState>`
-*`src/agents/decision.ts`*
-
-- Persists `pendingRecommendationIds` — UUIDs of recommendations still awaiting Telegram approval
-- **`this.schedule(cronExpr, "runPipelineFromScheduler", {})`** — the user's chosen schedule is stored in Agent SQLite and **survives deploys and restarts**
-- **`this.schedule(expirySeconds, "expireRecommendation", { id })`** — auto-expires unapproved cards after 23 hours
-- `runPipelineFromScheduler()` — the scheduled callback that orchestrates the full scan → decide → notify pipeline
-
-**Key distinction:** The Agents SDK provides the stateful runtime (persistent state, scheduling, Durable Object lifecycle). Claude (Anthropic) is the external reasoning model used only for LLM inference — it could be swapped for Workers AI with minimal changes.
+Both stateful services extend `Agent` from `@cloudflare/agents` — Durable Objects with embedded SQLite, typed state, and a built-in scheduler. The Agents SDK provides the stateful runtime (persistent state, scheduling, Durable Object lifecycle). Claude (Anthropic) is the external reasoning model used only for LLM inference and could be swapped for Workers AI with minimal changes.
 
 ```toml
 # wrangler.toml — Agents SDK requires new_sqlite_classes (not new_classes)
@@ -74,12 +58,98 @@ tag = "v1"
 new_sqlite_classes = ["FormScannerAgent", "DecisionAgent"]
 ```
 
+---
+
+### `FormScannerAgent`
+*`src/agents/formScanner.ts` — `extends Agent<Env, FormScannerState>`*
+
+Responsible for fetching, scoring, and persisting SEC insider signals.
+
+**Persistent state (`FormScannerState`):**
+
+| Field | Type | Description |
+|---|---|---|
+| `lastScannedAt` | `string \| null` | ISO-8601 UTC timestamp of the last completed scan |
+| `pendingSignalIds` | `number[]` | D1 row IDs of signals not yet processed by `DecisionAgent` |
+
+State is saved after every successful run via `this.setState()` and survives Worker restarts and deploys.
+
+**HTTP endpoints (`onRequest`):**
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/scan` | Run the full pipeline — returns `{ ok, signalCount, signals[] }` |
+| `GET` | `/status` | Health check — returns `{ lastScannedAt, pendingSignalCount }` |
+
+**`run()` pipeline (3 steps):**
+
+1. **EDGAR fetch** — calls `fetchForm4s(1)` for yesterday's Form 4 filings. If no open-market purchases (`transactionType === "P"`) are found, automatically expands to a 3-day lookback to handle weekends and light filing days.
+2. **Score** — `scoreSignals(filings)` filters to open-market purchases only, applies a multi-factor model (insider role, dollar value, cluster buys, recency), and returns the **top 10** sorted by score — no minimum score threshold.
+3. **Persist** — each signal is written to D1 via `insertSignal()`. Per-signal failures are caught individually so one bad record doesn't abort the batch.
+
+---
+
+### `DecisionAgent`
+*`src/agents/decision.ts` — `extends Agent<Env, DecisionState>`*
+
+Orchestrates the full trading pipeline: Claude inference, D1 persistence, Telegram notifications, and user-controlled scheduling.
+
+**Persistent state (`DecisionState`):**
+
+| Field | Type | Description |
+|---|---|---|
+| `pendingRecommendationIds` | `string[]` | UUIDs of D1 recommendations still awaiting Telegram approval |
+
+**HTTP endpoints (`onRequest`):**
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/decide` | Accept a signals array and run `decide()` |
+| `POST` | `/pipeline/run` | Trigger the full pipeline immediately (used by the `trade` Telegram command) |
+| `POST` | `/pipeline/schedule` | Body `{ cron, label }` — set a recurring cron schedule |
+| `GET` | `/pipeline/schedules` | List all active pipeline cron schedules with next-run times |
+| `DELETE` | `/pipeline/schedule` | Cancel all active pipeline schedules |
+| `GET` | `/status` | Returns `{ pendingRecommendationIds, pipelineSchedules }` |
+
+**Scheduled callbacks (invoked by `this.schedule()`):**
+
+| Callback | Trigger | What it does |
+|---|---|---|
+| `runPipelineFromScheduler()` | User-configured cron (e.g. `30 23 * * 1-5`) | Runs the full EDGAR → score → decide → Telegram pipeline |
+| `expireRecommendation({ id })` | `APPROVAL_EXPIRY_HOURS` seconds after card is sent (default 23h) | Marks the recommendation `EXPIRED` in D1 if not yet approved or rejected |
+
+**`decide()` pipeline (6 steps):**
+
+1. **Parallel data fetch** — `getPortfolio()`, `getBuyingPower()`, and `getPositionsWithThesis()` run concurrently via `Promise.all()`.
+2. **Portfolio summary** — builds a text block per position with entry price, current price, unrealised P&L %, days held, the original insider thesis, and insider name/role/value. This gives Claude the context to judge whether to exit a position.
+3. **Signals summary** — formats each scored signal: ticker, score, insider role/name, transaction value, date, and the scoring breakdown.
+4. **Claude inference** — calls `claude-opus-4-5` via the Anthropic Messages API with a strict system prompt (see below). Output is a pure JSON array — no prose.
+5. **Zod validation** — parses and validates the LLM output. Handles markdown fences, normalises tickers to uppercase, and converts `null`/`0` stop and take-profit prices to `undefined` (triggering a plain market order fallback).
+6. **Persist + notify** — for each actionable `BUY`/`SELL` decision:
+   - Guards: skip BUY if ticker already held; skip SELL if ticker not held; skip BUY if remaining buying power is insufficient (tracked within the run).
+   - Writes a `PENDING` recommendation to D1 via `insertRecommendation()`.
+   - Sends a Telegram approval card via `sendApprovalMessage()`.
+   - Schedules auto-expiry: `this.schedule(expirySeconds, "expireRecommendation", { id })`.
+   - Updates `this.setState()` with the new pending recommendation IDs.
+
+**Claude system prompt rules:**
+
+- **BUY** — only for tickers not already in the portfolio. Must include `stopPrice` and `takeProfitPrice`:
+  - `stopPrice` = entry × (1 − 5–12% depending on volatility)
+  - `takeProfitPrice` = entry × (1 + 10–25% depending on conviction)
+- **SELL** — evaluate each held position against its original thesis. Recommend SELL if:
+  - P&L has deteriorated below −10%
+  - Held > 30 days with no meaningful gain
+  - Original insider thesis has played out or been invalidated
+- **HOLD** — thesis intact, position within normal volatility
+- Output format: strict JSON array `[{ action, ticker, reasoning, notional?, qty?, stopPrice?, takeProfitPrice? }]`
+
 ### Why Agents SDK vs plain Durable Objects
 
 | Concern | Plain Durable Object | Agents SDK (`@cloudflare/agents`) |
 |---|---|---|
 | Persistent state | `ctx.storage.get/put` (key-value) | `this.setState()` / `this.state` (typed object, SQLite-backed) |
-| Scheduling | External cron in `wrangler.toml` | `this.schedule(cron\|delay\|date, method, payload)` — stored in Agent SQLite |
+| Scheduling | External cron in `wrangler.toml` | `this.schedule(cron\|delay\|date, method, payload)` — stored in Agent SQLite, user-controlled |
 | HTTP routing | Manual `fetch()` dispatch | `onRequest()` with automatic routing |
 | WebSockets | Manual `acceptWebSocket()` | `onConnect()` / `onMessage()` built in |
 
