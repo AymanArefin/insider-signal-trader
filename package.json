@@ -1,0 +1,27 @@
+{
+  "name": "insider-signal-trader",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "cf-typegen": "wrangler types",
+    "test:edgar": "tsx scripts/test-edgar.ts",
+    "test:scoring": "tsx scripts/test-scoring.ts",
+    "test:alpaca": "tsx scripts/test-alpaca.ts",
+    "test:telegram": "tsx scripts/test-telegram.ts",
+    "test:approval": "tsx scripts/test-approval.ts",
+    "test:live": "tsx scripts/test-live-flow.ts"
+  },
+  "dependencies": {
+    "@cloudflare/agents": "latest",
+    "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20250224.0",
+    "@types/node": "^25.3.1",
+    "tsx": "^4.21.0",
+    "typescript": "^5.7.3",
+    "wrangler": "^4.68.1"
+  }
+}

@@ -1,0 +1,27 @@
+name = "insider-signal-trader"
+main = "src/index.ts"
+compatibility_date = "2024-12-01"
+compatibility_flags = ["nodejs_compat"]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "insider-trader"
+database_id = "6fedc287-ad9d-463e-ab6f-24817db38d32"
+
+[vars]
+ALPACA_BASE_URL = "https://paper-api.alpaca.markets"
+ALPACA_DATA_URL = "https://data.alpaca.markets"
+POSITION_SIZE_USD = "10000"
+MIN_SIGNAL_SCORE = "50"
+APPROVAL_EXPIRY_HOURS = "23"
+APPROVAL_BASE_URL = "https://insider-signal-trader.aymanarefin21.workers.dev"
+
+[durable_objects]
+bindings = [
+  { name = "FORM_SCANNER", class_name = "FormScannerAgent" },
+  { name = "DECISION", class_name = "DecisionAgent" }
+]
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["FormScannerAgent", "DecisionAgent"]

@@ -1,0 +1,13 @@
+# Secrets — never commit
+.dev.vars
+*.dev.vars
+
+# Cloudflare local state
+.wrangler/
+
+# Node
+node_modules/
+dist/
+
+# OS
+.DS_Store

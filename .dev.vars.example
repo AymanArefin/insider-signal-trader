@@ -1,0 +1,17 @@
+# Copy this file to .dev.vars and fill in your secrets for local development.
+# NEVER commit .dev.vars to source control.
+
+# Alpaca Markets API credentials (paper or live)
+ALPACA_API_KEY=
+ALPACA_SECRET_KEY=
+
+# Anthropic Claude API key for the decision agent LLM calls
+ANTHROPIC_API_KEY=
+
+# Telegram bot token and target chat/channel ID for approval cards
+TELEGRAM_BOT_TOKEN=
+TELEGRAM_CHAT_ID=
+
+# Public base URL of this Worker, used to generate approve/reject deep-links
+# e.g. https://insider-signal-trader.<your-subdomain>.workers.dev
+APPROVAL_BASE_URL=
